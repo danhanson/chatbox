@@ -12,9 +12,10 @@ use client::{ClientAddress, ws_client::WsClient};
 use actix_web_actors::ws;
 use client_message::ClientMessage;
 use futures::stream::Stream;
-use futures::future::{Future, ok};
-use std::sync::{Arc, RwLock};
+use futures::future::{Future, ok, err, Either, collect};
+use std::sync::Arc;
 use std::io::Write;
+use futures_locks::RwLock;
 use serde_json;
 
 #[derive(Serialize)]
@@ -32,6 +33,10 @@ impl Room {
             comments: Vec::new()
         }
     }
+
+    fn add_comment(&mut self, comment: String) {
+        self.comments.push(comment);
+    }
 }
 
 struct ChatBox {
@@ -40,23 +45,37 @@ struct ChatBox {
 }
 
 impl ChatBox {
-    fn comment(&self, room_name: String, comment: String) {
-        if let Some(room_lock) = self.rooms.read().unwrap().get(&room_name) {
-            let mut room = room_lock.write().unwrap();
-            room.comments.push(comment.clone());
-            drop(room);
-            let room = room_lock.read().unwrap();
-            for member in room.members.iter() {
-                if let Some(con) = self.connections.read().unwrap().get(member) {
-                    let message = format!(
-                        r#"{{"topic":"comment","room":"{}","comment":"{}"}}"#,
-                        room_name,
-                        comment
-                    );
-                    con.send(ClientMessage(message));
+
+    fn comment<'a>(
+        &'a self,
+        room_name: &'a str,
+        comment: String
+    ) -> impl Future<Item=(), Error=()> + 'a {
+        self.rooms.read()
+            .and_then(move |rooms| {
+                if let Some(room_lock) = rooms.get(room_name) {
+                    Either::A(room_lock.write())
+                } else {
+                    Either::B(err(()))
                 }
-            }
-        }
+            })
+            .map(|mut room| {
+                room.add_comment(comment.clone());
+                (room, comment)
+            })
+            .join(self.connections.read())
+            .map(move |((room, comment), cons)| {
+                for mem in room.members.iter() {
+                    if let Some(con) = cons.get(mem) {
+                        let message = format!(
+                            r#"{{"topic":"comment","room":"{}","comment":"{}"}}"#,
+                            room_name,
+                            comment
+                        );
+                        con.send(ClientMessage(message))
+                    }
+                }
+            })
     }
 
     fn new() -> ChatBox {
@@ -93,7 +112,7 @@ fn post_comment(
             String::from_utf8(comment[..].into()).map_err(|_| HttpResponse::BadRequest().body("Not valid utf8"))
         })
         .map(move |comment| {
-            chat_box.comment(room.into_inner().room, comment);
+            chat_box.comment(&room.into_inner().room, comment);
             HttpResponse::Ok().finish()
         })
         .or_else(|e| {
@@ -104,39 +123,64 @@ fn post_comment(
 fn get_comments(
     room_selection: web::Path<RoomSelection>,
     chat_box: web::Data<Arc<ChatBox>>
-) -> HttpResponse {
-    if let Some(room_lock) = chat_box.rooms.read().unwrap().get(&room_selection.room) {
-        let room = room_lock.read().unwrap();
-        HttpResponse::Ok().body(serde_json::to_string(&room.comments).unwrap())
-    } else {
-        HttpResponse::NotFound().body("That room does not exist")
-    }
+) -> impl Future<Item=HttpResponse, Error=()> {
+    chat_box.rooms.read()
+        .and_then(move |rooms| {
+            if let Some(room_lock) = rooms.get(&room_selection.room) {
+                Either::A(
+                    room_lock.read()
+                        .map(|room| {
+                            HttpResponse::Ok().body(
+                                serde_json::to_string(&room.comments).unwrap()
+                            )
+                        })
+                )
+            } else {
+                Either::B(
+                    ok(HttpResponse::NotFound().body("That room does not exist"))
+                )
+            }
+        })
 }
 
 fn post_room(
     room_selection: web::Path<RoomSelection>,
     chat_box: web::Data<Arc<ChatBox>>
-) -> HttpResponse {
+) -> impl Future<Item=HttpResponse, Error=()> {
     let room = room_selection.into_inner().room;
-    let mut rooms = chat_box.rooms.write().unwrap();
-    match rooms.entry(room.clone()) {
-        Entry::Occupied(_) => HttpResponse::Ok().finish(),
-        Entry::Vacant(entry) => {
-            entry.insert(RwLock::new(Room::new(room)));
-            HttpResponse::Created().finish()
-        }
-    }
+    chat_box.rooms.write()
+        .map(|mut rooms| {
+            match rooms.entry(room.clone()) {
+                Entry::Occupied(_) => HttpResponse::Ok().finish(),
+                Entry::Vacant(entry) => {
+                    entry.insert(RwLock::new(Room::new(room)));
+                    HttpResponse::Created().finish()
+                }
+            }
+        })
 }
 
 fn get_room(
     room_selection: web::Path<RoomSelection>,
     chat_box: web::Data<Arc<ChatBox>>
-) -> HttpResponse {
-    if let Some(room) = chat_box.rooms.read().unwrap().get(&room_selection.room) {
-        HttpResponse::Ok().body(serde_json::to_string(&room).unwrap())
-    } else {
-        HttpResponse::NotFound().finish()
-    }
+) -> impl Future<Item=HttpResponse, Error=()> {
+    chat_box.rooms.read()
+        .and_then(move |rooms| {
+            if let Some(room_lock) = rooms.get(&room_selection.room) {
+                Either::A(
+                    room_lock.read()
+                        .map(|room| {
+                            HttpResponse::Ok().body(
+                                serde_json::to_string(&*room).unwrap()
+                            )
+                        })
+                )
+            } else {
+                Either::B(
+                    ok(HttpResponse::NotFound().finish())
+                )
+            }
+        })
 }
 
 #[derive(Serialize)]
@@ -145,29 +189,34 @@ struct RoomSummary<'a> {
     members: &'a HashSet<String>
 }
 
-fn get_room_list(
+fn get_room_list<'a>(
     chat_box: web::Data<Arc<ChatBox>>
-) -> HttpResponse {
-    let mut msg = vec![b'['];
-    for value_lock in chat_box.rooms.read().unwrap().values() {
-        let room = value_lock.read().unwrap();
-        serde_json::to_writer(
-            msg.by_ref(),
-            &RoomSummary {
-                name: &room.name,
-                members: &room.members
-            }
-        ).unwrap();
-        msg.push(b',');
-    }
-    let last = msg.last_mut().unwrap();
-    if *last == b',' {
-        *last = b']';
-    } else {
-        msg.push(b']');
-    }
-    HttpResponse::Ok().body(msg)
-}   
+) -> impl Future<Item=HttpResponse, Error=()> {
+    chat_box.rooms.read()
+        .and_then(|rooms_map| {
+            let values: Vec<_> = rooms_map.values().map(|room| room.read()).collect();
+            collect(values).map(|rooms| {
+                let mut msg = vec![b'['];
+                for room in rooms.into_iter() {
+                    serde_json::to_writer(
+                        msg.by_ref(),
+                        &RoomSummary {
+                            name: &room.name,
+                            members: &room.members
+                        }
+                    ).unwrap()
+                }
+                msg.push(b',');
+                let last = msg.last_mut().unwrap();
+                if *last == b',' {
+                    *last = b']';
+                } else {
+                    msg.push(b']');
+                }
+                HttpResponse::Ok().body(msg)
+            })
+        })
+}
 
 fn main() -> std::io::Result<()> {
     let chat_box = Arc::new(ChatBox::new());
@@ -176,17 +225,17 @@ fn main() -> std::io::Result<()> {
             .data(chat_box.clone())
             .service(
                 web::resource("/rooms")
-                    .route(web::get().to(get_room_list))
+                    .route(web::get().to_async(get_room_list))
             )
             .service(
                 web::resource("/room/{room}")
-                    .route(web::post().to(post_room))
-                    .route(web::get().to(get_room))
+                    .route(web::post().to_async(post_room))
+                    .route(web::get().to_async(get_room))
             )
             .service(
                 web::resource("/room/{room}/comments")
                     .route(web::post().to_async(post_comment))
-                    .route(web::get().to(get_comments))
+                    .route(web::get().to_async(get_comments))
             )
             .service(web::resource("/ws/{room}").to(get_socket))
             .service(fs::Files::new("/", "./static").index_file("index.html"))
