@@ -46,25 +46,25 @@ struct ChatBox {
 
 impl ChatBox {
 
-    fn comment<'a>(
-        &'a self,
-        room_name: &'a str,
+    fn comment(
+        &self,
+        room_name: String,
         comment: String
-    ) -> impl Future<Item=(), Error=()> + 'a {
+    ) -> impl Future<Item=(), Error=()> {
         self.rooms.read()
             .and_then(move |rooms| {
-                if let Some(room_lock) = rooms.get(room_name) {
-                    Either::A(room_lock.write())
+                if let Some(room_lock) = rooms.get(&room_name) {
+                    Either::A(room_lock.write().map(|room| (room, room_name)))
                 } else {
                     Either::B(err(()))
                 }
             })
-            .map(|mut room| {
+            .map(|(mut room, room_name)| {
                 room.add_comment(comment.clone());
-                (room, comment)
+                (room, comment, room_name)
             })
             .join(self.connections.read())
-            .map(move |((room, comment), cons)| {
+            .map(|((room, comment, room_name), cons)| {
                 for mem in room.members.iter() {
                     if let Some(con) = cons.get(mem) {
                         let message = format!(
@@ -112,7 +112,7 @@ fn post_comment(
             String::from_utf8(comment[..].into()).map_err(|_| HttpResponse::BadRequest().body("Not valid utf8"))
         })
         .map(move |comment| {
-            chat_box.comment(&room.into_inner().room, comment);
+            chat_box.comment(room.into_inner().room, comment);
             HttpResponse::Ok().finish()
         })
         .or_else(|e| {
@@ -189,7 +189,7 @@ struct RoomSummary<'a> {
     members: &'a HashSet<String>
 }
 
-fn get_room_list<'a>(
+fn get_room_list(
     chat_box: web::Data<Arc<ChatBox>>
 ) -> impl Future<Item=HttpResponse, Error=()> {
     chat_box.rooms.read()
